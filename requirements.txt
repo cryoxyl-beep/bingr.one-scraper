@@ -1,0 +1,7 @@
+# Permissive ranges — installs cleanly on Windows/macOS/Linux without
+# "no matching distribution" errors. Tested working as of Oct 2024.
+fastapi>=0.110,<0.200
+uvicorn[standard]>=0.27,<0.40
+pydantic>=2.5,<3.0
+playwright>=1.40,<2.0
+httpx[http2]>=0.27,<1.0   # for bingr_direct.py — direct POST /api/stream client

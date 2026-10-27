@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env
+
+# Local cache + output (regenerated on the Space)
+stream_cache.json
+bingr_catalog_data.json
+*.jsonl
+bingr_trace_*.jsonl
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Local dev — not needed in the Docker image (frontend is on Vercel)
+# (we keep test_player.html + bingr_trace.py in the image as debug tools,
+# they're tiny and harmless — backend doesn't serve them anyway)

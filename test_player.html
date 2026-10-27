@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bingr Test Player (HLS.js — multi-audio + subs)</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+<style>
+body { background:#0b0c10; color:#f3f4f6; font-family:system-ui; padding:20px; margin:0; }
+input { width:100%; padding:8px; background:#151722; color:#fff; border:1px solid #444; border-radius:6px; box-sizing:border-box; }
+button { background:#6366f1; color:#fff; border:none; padding:9px 16px; border-radius:6px; cursor:pointer; margin:4px 4px 4px 0; font-weight:600; font-size:13px; }
+button.sec { background:#374151; }
+.url-list { background:#151722; padding:10px; border-radius:6px; margin:8px 0; font-family:monospace; font-size:11px; word-break:break-all; }
+.status { padding:8px 12px; background:rgba(16,185,129,0.12); color:#34d399; border-radius:6px; margin:8px 0; font-family:monospace; font-size:13px; }
+h2 { margin:0 0 10px; }
+h3 { margin:14px 0 6px; font-size:14px; color:#9ca3af; }
+label { display:block; margin:6px 0 3px; color:#9ca3af; font-size:13px; }
+video { width:100%; max-width:900px; max-height:540px; background:#000; border-radius:12px; display:block; }
+.track-bar { display:flex; gap:14px; align-items:flex-end; flex-wrap:wrap; margin:10px 0; padding:10px; background:#151722; border-radius:8px; }
+.track-bar label { margin:0; }
+.track-bar select { background:#0b0c10; color:#fff; border:1px solid #444; padding:6px 8px; border-radius:6px; font-size:13px; min-width:200px; max-width:340px; }
+.track-bar .count { color:#9ca3af; font-size:11px; margin-left:6px; font-family:monospace; }
+</style>
+</head>
+<body>
+<h2>Bingr Test Player (HLS.js — multi-audio + multi-subs)</h2>
+
+<div style="margin-bottom:10px;">
+  <label>Backend URL</label>
+  <input id="backendUrl" value="http://127.0.0.1:8765"/>
+  <label style="margin-top:6px;">Bingr Watch URL</label>
+  <input id="bingrUrl" placeholder="https://bingr.one/watch/tv/1396/1/1"/>
+  <div style="margin-top:6px;">
+    <button onclick="scrape()">Scrape &amp; Play</button>
+    <button class="sec" onclick="pasteStream()">Paste raw stream URL</button>
+    <button class="sec" onclick="clearCache()">Clear Cache</button>
+  </div>
+</div>
+
+<div id="status" class="status">Ready.</div>
+<div id="streamList"></div>
+
+<div class="track-bar">
+  <label>Audio track
+    <select id="audioPicker" onchange="setAudio(this.value)">
+      <option value="-1">— scrape first —</option>
+    </select>
+    <span class="count" id="audioCount"></span>
+  </label>
+  <label>Subtitles
+    <select id="subPicker" onchange="setSubtitle(this.value)">
+      <option value="-1">Off</option>
+    </select>
+    <span class="count" id="subCount"></span>
+  </label>
+</div>
+
+<video id="player" controls autoplay playsinline crossorigin="anonymous"></video>
+
+<script>
+const video = document.getElementById('player');
+const statusEl = document.getElementById('status');
+const streamListEl = document.getElementById('streamList');
+const audioSel = document.getElementById('audioPicker');
+const subSel = document.getElementById('subPicker');
+const audioCountEl = document.getElementById('audioCount');
+const subCountEl = document.getElementById('subCount');
+let hls = null;
+let sidecarSubs = [];   // from JSON response `subtitles` array
+let lastStreamUrl = null;
+
+function log(msg) {
+  statusEl.textContent = msg;
+  console.log('[player]', msg);
+}
+
+// Pick the best stream — prefer SilentBrowser streams (hianime proxy URLs
+// wrapped in our manifest-proxy — these work because the apiKey IP matches
+// our backend IP). Raw upstream URLs from JSON (BingrAPI scraper) are usually
+// IP-bound to hianime's server and fail.
+function pickStream(streams) {
+  if (!streams || !streams.length) return null;
+  const silent = streams.find(s => s.scraper === 'SilentBrowser');
+  if (silent) return silent.url;
+  const signed = streams.find(s =>
+    /[?&](Policy|Signature|Key-Pair-Id)=/.test(s.url)
+  );
+  if (signed) return signed.url;
+  const proxy = streams.find(s => s.url.includes('/api/manifest-proxy'));
+  if (proxy) return proxy.url;
+  return streams[0].url;
+}
+
+function clearTrackPickers() {
+  audioSel.innerHTML = '<option value="-1">Default</option>';
+  subSel.innerHTML = '<option value="-1">Off</option>';
+  audioCountEl.textContent = '';
+  subCountEl.textContent = '';
+}
+
+function populateTrackPickers() {
+  // --- Audio tracks ---
+  let audioN = 0;
+  if (hls && hls.audioTracks && hls.audioTracks.length > 0) {
+    audioN = hls.audioTracks.length;
+    audioSel.innerHTML = '';
+    hls.audioTracks.forEach((t, i) => {
+      // Some HLS.js builds use `name` + `lang`; others use `name` + `language`. Be defensive.
+      const lang = t.lang || t.language || '?';
+      const name = t.name || lang || ('Track ' + i);
+      const opt = document.createElement('option');
+      opt.value = String(i);
+      opt.textContent = `${name} (${lang})` + (t.default ? ' [default]' : '');
+      if (i === hls.audioTrack) opt.selected = true;
+      audioSel.appendChild(opt);
+    });
+  } else {
+    audioSel.innerHTML = '<option value="-1">Default (no alternates)</option>';
+  }
+  audioCountEl.textContent = audioN > 0 ? audioN + ' track' + (audioN === 1 ? '' : 's') : '';
+
+  // --- Subtitle tracks (from manifest) ---
+  subSel.innerHTML = '';
+  const off = document.createElement('option');
+  off.value = '-1';
+  off.textContent = 'Off';
+  subSel.appendChild(off);
+
+  let subN = 0;
+  if (hls && hls.subtitleTracks && hls.subtitleTracks.length > 0) {
+    subN = hls.subtitleTracks.length;
+    hls.subtitleTracks.forEach((t, i) => {
+      const lang = t.lang || t.language || '?';
+      const name = t.name || lang || ('Sub ' + i);
+      const opt = document.createElement('option');
+      opt.value = String(i);
+      opt.textContent = `${name} (${lang})`;
+      subSel.appendChild(opt);
+    });
+  }
+  // Sidecar subtitles from Bingr JSON response
+  if (sidecarSubs.length > 0) {
+    sidecarSubs.forEach((s, i) => {
+      const idx = 1000 + i;
+      const opt = document.createElement('option');
+      opt.value = String(idx);
+      opt.textContent = `External: ${s.label || s.lang || 'Sub ' + i} (${s.lang || '?'})`;
+      subSel.appendChild(opt);
+    });
+  }
+  subCountEl.textContent = (subN + sidecarSubs.length) > 0
+    ? (subN + ' in-manifest' + (sidecarSubs.length ? ' + ' + sidecarSubs.length + ' external' : ''))
+    : '';
+
+  // Restore previous selection if still valid
+  if (hls && hls.subtitleTrack >= 0 && hls.subtitleTrack < subN) {
+    subSel.value = String(hls.subtitleTrack);
+  } else if (lastStreamUrl === video.dataset.streamUrl && video.dataset.subIdx !== undefined) {
+    subSel.value = video.dataset.subIdx;
+  } else {
+    subSel.value = '-1';
+  }
+}
+
+function setAudio(idx) {
+  idx = parseInt(idx, 10);
+  if (!hls || !hls.audioTracks || hls.audioTracks.length === 0) {
+    log('No alternate audio tracks in this stream.');
+    return;
+  }
+  if (idx < 0 || idx >= hls.audioTracks.length) {
+    log('Audio: default');
+    return;
+  }
+  hls.audioTrack = idx;
+  const t = hls.audioTracks[idx];
+  log('Audio: ' + (t.name || t.lang || '#' + idx) + ' (' + (t.lang || t.language || '?') + ')');
+}
+
+function setSubtitle(idx) {
+  idx = parseInt(idx, 10);
+  // Remove any previously-injected sidecar <track> elements
+  video.querySelectorAll('track[data-sidecar]').forEach(t => t.remove());
+
+  if (idx === -1) {
+    if (hls) hls.subtitleTrack = -1;
+    log('Subtitles: off');
+    video.dataset.subIdx = '-1';
+    return;
+  }
+
+  if (idx >= 1000) {
+    // Sidecar subtitle from Bingr JSON
+    const sidecar = sidecarSubs[idx - 1000];
+    if (!sidecar) return;
+    if (hls) hls.subtitleTrack = -1;  // disable manifest subs so they don't double
+    const track = document.createElement('track');
+    track.kind = 'subtitles';
+    track.src = sidecar.url;
+    track.srclang = sidecar.lang || 'en';
+    track.label = sidecar.label || sidecar.lang || 'External';
+    track.setAttribute('data-sidecar', '1');
+    track.default = true;
+    track.mode = 'showing';
+    video.appendChild(track);
+    // Activate it once loaded
+    track.addEventListener('load', () => { track.track.mode = 'showing'; });
+    log('Subtitles (external): ' + sidecar.label + ' [' + (sidecar.lang || '?') + ']');
+    video.dataset.subIdx = String(idx);
+    return;
+  }
+
+  // Manifest subtitle
+  if (hls && hls.subtitleTracks && hls.subtitleTracks.length > 0) {
+    hls.subtitleTrack = idx;
+    const t = hls.subtitleTracks[idx];
+    log('Subtitles: ' + (t.name || t.lang || '#' + idx) + ' (' + (t.lang || t.language || '?') + ')');
+    video.dataset.subIdx = String(idx);
+  }
+}
+
+function loadStream(url, subs) {
+  if (!url) { log('No URL.'); return; }
+  log('Loading: ' + url);
+  console.log('[player] Full URL:', url);
+  if (hls) { hls.destroy(); hls = null; }
+  clearTrackPickers();
+  // Remove any previously-injected sidecar tracks
+  video.querySelectorAll('track[data-sidecar]').forEach(t => t.remove());
+  // Stash sidecar subs for the picker
+  sidecarSubs = Array.isArray(subs) ? subs : [];
+  video.dataset.streamUrl = url;
+  video.dataset.subIdx = '-1';
+
+  if (Hls.isSupported()) {
+    hls = new Hls({
+      enableWorker: true,
+      lowLatencyMode: false,
+      // Bigger buffers — the previous 15s/60s was too tight, caused stalls
+      // on every seek because HLS.js had to re-fetch from scratch. 30s ahead
+      // + 60s back means seeks within the buffer are instant, and seeks
+      // outside it only have to fetch a few segments.
+      maxBufferLength: 30,
+      maxMaxBufferLength: 120,
+      // Keep 60s of buffer BEHIND the playhead so backward seeks don't
+      // trigger a re-download.
+      backBufferLength: 60,
+      // Tolerate small gaps in the timeline (some manifests have ~0.1-0.5s
+      // gaps between segments — without this HLS.js stalls on the gap).
+      maxBufferHole: 0.5,
+      maxSeekHole: 2.0,
+      // ABR tuning
+      startLevel: -1,                // let ABR pick the best start level
+      capLevelToPlayerSize: true,   // don't pick 1080p on a 480p player
+      abrEwmaDefaultEstimate: 1500000,  // start pessimistic (1.5Mbps)
+      // Timeout / retry — fail faster on dead segments
+      fragLoadingTimeOut: 15000,
+      fragLoadingMaxRetry: 4,
+      manifestLoadingTimeOut: 10000,
+      manifestLoadingMaxRetry: 2,
+      fragLoadingMaxRetryTimeout: 8000,
+      manifestLoadingMaxRetryTimeout: 5000,
+      // Render WebVTT cues natively (lets us mix manifest subs + sidecar <track>)
+      renderTextTracksNatively: true,
+      // Start with subtitle track off — user picks from dropdown
+      subtitleTrack: -1,
+    });
+    hls.loadSource(url);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, (e, d) => {
+      const levels = d.levels.map(l => `${l.height}p@${Math.round(l.bitrate/1000)}k`).join(', ');
+      log(`Manifest parsed (${d.levels.length} levels: ${levels}). Buffering...`);
+      populateTrackPickers();
+    });
+    // HLS.js emits these when audio/sub tracks get added dynamically (e.g.
+    // after parsing a sub-playlist returned by /api/seg-proxy).
+    hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, () => populateTrackPickers());
+    hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, () => populateTrackPickers());
+    hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, (e, d) => {
+      // Keep dropdown in sync when HLS.js auto-switches (e.g. ABR fallback)
+      if (audioSel.value !== String(d.id)) {
+        audioSel.value = String(d.id);
+      }
+    });
+    hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, (e, d) => {
+      if (String(subSel.value) !== String(d.id !== -1 ? d.id : -1)) {
+        // Only auto-sync if user picked an in-manifest sub (not a sidecar or Off)
+        const cur = parseInt(subSel.value, 10);
+        if (cur >= 0 && cur < 1000) {
+          subSel.value = String(d.id === -1 ? -1 : d.id);
+        }
+      }
+    });
+    hls.on(Hls.Events.FRAG_BUFFERED, (e, d) => {
+      if (video.paused && video.buffered.length > 0) video.play().catch(()=>{});
+      const ahead = video.buffered.length > 0 ? (video.buffered.end(0) - video.currentTime).toFixed(1) : '0';
+      log(`▶ Playing — ${ahead}s buffered ahead`);
+    });
+    hls.on(Hls.Events.ERROR, (e, d) => {
+      console.log('[player] HLS event:', d.type, d.details, d.fatal ? '(FATAL)' : '', d.response ? `code=${d.response.code}` : '');
+      log('HLS error: ' + d.details + (d.fatal ? ' (FATAL)' : ''));
+      if (d.fatal) {
+        if (d.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+        else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+      }
+    });
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    // Safari native HLS — populate picker after metadata loads
+    video.src = url;
+    video.addEventListener('loadedmetadata', () => {
+      video.play().catch(()=>{});
+      populateTrackPickers();
+    }, { once: true });
+    // Safari exposes audioTracks/textTracks on the video element natively
+    setTimeout(populateTrackPickers, 1500);
+  } else {
+    log('HLS not supported in this browser.');
+  }
+}
+
+async function scrape() {
+  const backend = document.getElementById('backendUrl').value.trim().replace(/\/$/, '');
+  const bingrUrl = document.getElementById('bingrUrl').value.trim();
+  if (!backend || !bingrUrl) { log('Fill in both URLs.'); return; }
+  log('POSTing to ' + backend + '/api/resolve ...');
+  try {
+    const res = await fetch(backend + '/api/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: bingrUrl }),
+    });
+    const data = await res.json();
+    if (!data.stream_links || !data.stream_links.length) {
+      log('No stream links: ' + JSON.stringify(data.detail || data).slice(0, 200));
+      return;
+    }
+    // Stash sidecar subtitles from Bingr JSON
+    const sidecar = Array.isArray(data.subtitles) ? data.subtitles : [];
+    streamListEl.innerHTML = '<strong>All captured streams (click to play):</strong>' + data.stream_links.map((s, i) =>
+      `<div class="url-list">#${i+1} [${s.quality}] ${s.scraper}${s.proxied ? ' (proxied)' : ''}<br/>${s.url}<br/><button class="sec" onclick="loadStream('${s.url}', window.__lastSubs)">Play this one</button></div>`
+    ).join('');
+    window.__lastSubs = sidecar;
+    const chosen = pickStream(data.stream_links);
+    log(`Auto-picked best stream (${data.stream_links.length} captured). Sidecar subs: ${sidecar.length}.`);
+    loadStream(chosen, sidecar);
+  } catch (e) { log('Fetch failed: ' + e.message); }
+}
+
+function pasteStream() {
+  const url = prompt('Paste a stream URL:');
+  if (url) loadStream(url, []);
+}
+
+async function clearCache() {
+  const backend = document.getElementById('backendUrl').value.trim().replace(/\/$/, '');
+  try {
+    await fetch(backend + '/api/cache/clear', { method: 'POST' });
+    log('Cache cleared.');
+  } catch (e) { log('Clear failed: ' + e.message); }
+}
+</script>
+</body>
+</html>

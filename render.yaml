@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: bingr-scraper
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeploy: true
+    # Render injects $PORT automatically — our scraper_api.py reads it from env.
+    # Render's health check pings /api/health (defined below).
+    healthCheckPath: /api/health
+    envVars:
+      - key: BINGR_ALLOWED_ORIGINS
+        # For dev: "*" works. For prod: lock to https://miyoro.vercel.app
+        value: "*"
+      - key: BINGR_CACHE_FILE
+        # Render free tier has no persistent disk — cache lives in /tmp
+        # (ephemeral). Lost on restart/sleep, but in-memory cache still works
+        # during warm sessions.
+        value: /tmp/stream_cache.json
+      - key: BINGR_OUTPUT_FILE
+        value: /tmp/bingr_catalog_data.json
+      - key: HOST
+        value: 0.0.0.0
+      - key: PYTHONUNBUFFERED
+        # So print() statements appear in Render logs immediately
+        value: "1"
